@@ -52,7 +52,9 @@ stride (and thus logit frame rate) and label set:
 label set then come from that file's GGUF metadata. Without `-V`,
 `edmformer-f32.gguf` is preferred when present. If the requested file is
 missing, the CLI falls back to the other one with a runtime stride override
-(the pre-fine-tune behavior) and a warning.
+(the pre-fine-tune behavior) and a warning. See
+[Models: provenance and GGUF conversion](#models-provenance-and-gguf-conversion)
+for where to download the checkpoints and how to convert them.
 
 ## Building
 
@@ -258,30 +260,76 @@ hardcoded label table.
 | `songformer-f32.gguf` (104 MB) | [`ASLP-lab/SongFormer`](https://huggingface.co/ASLP-lab/SongFormer) — `SongFormer.safetensors` | ASLP@NPU (CC-BY-4.0), paper [arXiv:2510.02797](https://arxiv.org/abs/2510.02797) | The MSA head: input fusion, TimeDownsample, 4-layer x-transformers encoder, boundary + function heads (EMA weights) |
 | `edmformer-f32.gguf` (104 MB) | [`25ohms/EDM-98`](https://github.com/25ohms/EDM-98) — `data/checkpoints/model.pt` (git LFS) | 25ohms | Same architecture, fine-tuned on the EDM-98 dataset via [`25ohms/EDMFormer`](https://github.com/25ohms/EDMFormer) (raw trainer checkpoint, EMA state at step 2400, dataset id 9, labels intro/buildup/drop/breakdown/outro/silence) |
 
-The Python reference (`EDMFormer/` and `SongFormer/` repos) downloads exactly
-these files via `src/SongFormer/utils/fetch_pretrained.py` and
-`MuQ.from_pretrained()`; the converters read them from those locations. The
-fine-tuned EDM checkpoint comes from the EDM-98 repo's LFS storage
-(`https://media.githubusercontent.com/media/25ohms/EDM-98/main/data/checkpoints/model.pt`).
+### Downloading the source checkpoints
+
+The converters expect the checkpoints in the layout of the
+[`25ohms/EDMFormer`](https://github.com/25ohms/EDMFormer) repo
+(`src/SongFormer/ckpts/...`), so clone it next to this repo and fetch the
+weights into it. All commands run from the directory that contains both
+checkouts:
+
+```bash
+# one-time Python env — used for the MuQ download below and the converters
+python3 -m venv .venv && . .venv/bin/activate
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install numpy safetensors gguf huggingface_hub omegaconf
+
+git clone https://github.com/25ohms/EDMFormer.git
+cd EDMFormer/src/SongFormer
+
+# MusicFM (SSL model, MIT) + SongFormer head (upstream weights, CC-BY-4.0)
+curl -L --create-dirs --parallel \
+  -o ckpts/MusicFM/msd_stats.json      "https://huggingface.co/minzwon/MusicFM/resolve/main/msd_stats.json" \
+  -o ckpts/MusicFM/pretrained_msd.pt   "https://huggingface.co/minzwon/MusicFM/resolve/main/pretrained_msd.pt" \
+  -o ckpts/SongFormer.safetensors      "https://huggingface.co/ASLP-lab/SongFormer/resolve/main/SongFormer.safetensors"
+
+# verify against the checksums shipped in the repo
+sed 's/    /  /' ckpts/md5sum.txt | grep -v "SongFormer\.pt" | (cd ckpts && md5sum -c -)
+
+# EDM-98 fine-tuned head (git LFS object, ~418 MB)
+curl -L -o ckpts/edm98-model.pt \
+  "https://media.githubusercontent.com/media/25ohms/EDM-98/main/data/checkpoints/model.pt"
+echo "1412e207645e9a71adc09777714dd251ce7805cada9bf19518d2e455a977e165  ckpts/edm98-model.pt" | sha256sum -c -
+
+# MuQ (CC-BY-NC-4.0): the converter reads it from the HuggingFace cache
+python -c "from huggingface_hub import hf_hub_download as d; \
+  d('OpenMuQ/MuQ-large-msd-iter','model.safetensors'); \
+  d('OpenMuQ/MuQ-large-msd-iter','config.json')"
+```
+
+This is exactly what the Python reference does itself
+(`src/SongFormer/utils/fetch_pretrained.py` and `MuQ.from_pretrained()`).
+The SongFormer head weights referenced by the EDMFormer repo are identical to
+upstream (same md5), so no separate download exists for it; the EDM fine-tune
+lives in the [`25ohms/EDM-98`](https://github.com/25ohms/EDM-98) repo under
+`data/checkpoints/model.pt` (tracked with git LFS — a plain
+`raw.githubusercontent.com` fetch returns the 134-byte pointer file, hence
+the `media.githubusercontent.com` URL above).
 
 ### How the GGUF files are generated
 
-The converters live in `convert/` and run inside the EDMFormer PDM venv
-(needs `torch`, `safetensors`, `torchaudio`, `gguf`; the checkpoints must be
-present — running the Python pipeline once takes care of downloads):
+The converters live in `convert/` and run in the venv created above (torch
+CPU is enough; `omegaconf` is needed because the EDM-98 trainer checkpoint
+pickles its config — the EDMFormer PDM venv works too). Run them from the
+EDMFormer repo root:
 
 ```bash
 cd EDMFormer
-pdm run python ../edmformer.cpp/convert/convert_ssl.py --model musicfm --out ../edmformer.cpp/models/musicfm-f16.gguf
-pdm run python ../edmformer.cpp/convert/convert_ssl.py --model muq     --out ../edmformer.cpp/models/muq-f16.gguf
-# upstream head (8-class general music labels)
-pdm run python ../edmformer.cpp/convert/convert_songformer.py --variant songformer --out ../edmformer.cpp/models/songformer-f32.gguf
-# EDM fine-tuned head (EDM-98 trainer checkpoint; .pt with model_ema/ema_model.* is unwrapped)
-pdm run python ../edmformer.cpp/convert/convert_songformer.py \
+python ../edmformer.cpp/convert/convert_ssl.py --model musicfm --out ../edmformer.cpp/models/musicfm-f16.gguf
+python ../edmformer.cpp/convert/convert_ssl.py --model muq     --out ../edmformer.cpp/models/muq-f16.gguf
+# upstream head -> songformer-f32.gguf (8-class general music labels)
+python ../edmformer.cpp/convert/convert_songformer.py --variant songformer --out ../edmformer.cpp/models/songformer-f32.gguf
+# EDM fine-tuned head -> edmformer-f32.gguf (EDM-98 trainer checkpoint;
+# .pt with model_ema/ema_model.* EMA state is unwrapped automatically)
+python ../edmformer.cpp/convert/convert_songformer.py \
     --ckpt src/SongFormer/ckpts/edm98-model.pt \
     --variant edmformer --dataset EDMFormer \
     --out ../edmformer.cpp/models/edmformer-f32.gguf
 ```
+
+Afterwards `models/` contains all four GGUFs the CLI needs
+(`musicfm-f16.gguf`, `muq-f16.gguf`, `songformer-f32.gguf`,
+`edmformer-f32.gguf` — ~1.4 GB total).
 
 The conversion is not a plain dump — several inference-time transforms are
 baked in:
