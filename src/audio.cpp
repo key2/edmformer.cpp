@@ -132,6 +132,75 @@ static std::vector<float> decode_coreaudio(const std::string & path, double & sr
     if (!tmp_link.empty()) unlink(tmp_link.c_str());
     return data;
 }
+#else
+// decode any ffmpeg-supported container (m4a/aac/mp4/ogg/flac/...) to float32
+// PCM by piping through the ffmpeg CLI — the non-macOS stand-in for CoreAudio.
+// No link-time dependency; if ffmpeg is not in PATH this simply fails and the
+// caller reports the decode error. All channels are kept so the plain-mean
+// downmix matches the rest of the pipeline.
+#ifdef _WIN32
+// _popen runs through cmd.exe: double-quote paths ('"' is not a legal
+// filename character on Windows) and read the pipe in binary mode so CRLF
+// translation cannot corrupt the raw f32 stream.
+#define EDM_POPEN(cmd) _popen((cmd), "rb")
+#define EDM_PCLOSE     _pclose
+#define EDM_DEVNULL    "NUL"
+static std::string shell_quote(const std::string & s) {
+    return "\"" + s + "\"";
+}
+#else
+#define EDM_POPEN(cmd) popen((cmd), "r")
+#define EDM_PCLOSE     pclose
+#define EDM_DEVNULL    "/dev/null"
+static std::string shell_quote(const std::string & s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') q += "'\\''";
+        else q += c;
+    }
+    q += "'";
+    return q;
+}
+#endif
+
+static bool ffprobe_stream_info(const std::string & path, double & sr, uint32_t & channels) {
+    const std::string cmd =
+        "ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels "
+        "-of csv=p=0 " + shell_quote(path) + " 2>" EDM_DEVNULL;
+    FILE * p = EDM_POPEN(cmd.c_str());
+    if (!p) return false;
+    char line[256] = {0};
+    const bool got = fgets(line, sizeof(line), p) != nullptr;
+    EDM_PCLOSE(p);
+    if (!got) return false;
+    double r = 0;
+    unsigned ch = 0;
+    if (sscanf(line, "%lf,%u", &r, &ch) != 2 || r <= 0.0 || ch == 0) return false;
+    sr = r;
+    channels = ch;
+    return true;
+}
+
+static std::vector<float> decode_ffmpeg(const std::string & path, double & sr, uint32_t & channels) {
+    if (!ffprobe_stream_info(path, sr, channels)) return {};
+
+    const std::string cmd =
+        "ffmpeg -v error -nostdin -i " + shell_quote(path) +
+        " -map a:0 -f f32le -acodec pcm_f32le - 2>" EDM_DEVNULL;
+    FILE * p = EDM_POPEN(cmd.c_str());
+    if (!p) return {};
+
+    std::vector<float> data;
+    std::vector<float> buf(65536);
+    size_t n;
+    while ((n = fread(buf.data(), sizeof(float), buf.size(), p)) > 0) {
+        data.insert(data.end(), buf.begin(), buf.begin() + n);
+    }
+    if (EDM_PCLOSE(p) != 0 || data.empty()) return {};
+
+    data.resize(data.size() - data.size() % channels);  // drop any partial frame
+    return data;
+}
 #endif
 
 static std::vector<float> downmix(const float * data, uint64_t frames, uint32_t channels) {
@@ -193,10 +262,25 @@ std::vector<float> load_audio(const std::string & path, int target_sr) {
             decoded = true;
         }
     }
+#else
+    if (!decoded) {
+        // ffmpeg handles m4a/aac/mp4 (and files with wrong extensions)
+        double ff_sr = 0;
+        uint32_t ch = 0;
+        std::vector<float> buf = decode_ffmpeg(path, ff_sr, ch);
+        if (!buf.empty()) {
+            mono = downmix(buf.data(), buf.size() / ch, ch);
+            sr = ff_sr;
+            decoded = true;
+        }
+    }
 #endif
 
     if (!decoded) {
         fprintf(stderr, "failed to decode audio: %s\n", path.c_str());
+#ifndef __APPLE__
+        fprintf(stderr, "(formats beyond mp3/wav/npy need ffmpeg+ffprobe in PATH)\n");
+#endif
         return {};
     }
 

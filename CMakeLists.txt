@@ -36,6 +36,11 @@ if(APPLE)
     target_link_libraries(edmformer_core PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
 endif()
 
+if(WIN32)
+    # MinGW hides M_PI under -std=c++17 (strict ANSI) unless this is defined
+    target_compile_definitions(edmformer_core PRIVATE _USE_MATH_DEFINES)
+endif()
+
 add_executable(edmformer-cli src/main.cpp)
 target_link_libraries(edmformer-cli PRIVATE edmformer_core)
 

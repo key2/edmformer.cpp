@@ -9,18 +9,43 @@
 
 static void usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [options] <audio.{mp3,wav,npy}>\n"
+        "usage: %s [options] <audio.{mp3,wav,m4a,npy}>\n"
         "\n"
         "options:\n"
         "  -m DIR    model directory containing musicfm-f16.gguf, muq-f16.gguf,\n"
-        "            songformer-f32.gguf (default: models)\n"
-        "  -V NAME   head variant: songformer (8.333 fps, upstream) or\n"
-        "            edmformer (12.5 fps); default: from GGUF metadata\n"
+        "            and the head weights (default: models)\n"
+        "  -V NAME   head model: edmformer (edmformer-f32.gguf, EDM fine-tune,\n"
+        "            12.5 fps, EDM labels) or songformer (songformer-f32.gguf,\n"
+        "            upstream weights, 8.333 fps, 8-class labels);\n"
+        "            default: edmformer when edmformer-f32.gguf exists\n"
         "  -t N      threads (default: hardware concurrency)\n"
         "  -o PREFIX write PREFIX.txt (MSA) and PREFIX.json\n"
         "  -c        CPU only (disable GPU backend)\n"
         "  -q        quiet\n",
         argv0);
+}
+
+static bool file_exists(const std::string & p) {
+    FILE * f = fopen(p.c_str(), "rb");
+    if (f) fclose(f);
+    return f != nullptr;
+}
+
+// -V selects which head weights to load: each variant has its own GGUF
+// (edmformer = EDM fine-tuned checkpoint, songformer = upstream checkpoint);
+// stride, frame rate, label set and dataset id then come from that file's
+// metadata. Falls back to the other file (with a runtime stride override and
+// a warning) when the requested one is missing.
+static std::string pick_head_path(const std::string & model_dir, const std::string & variant) {
+    const std::string edm  = model_dir + "/edmformer-f32.gguf";
+    const std::string song = model_dir + "/songformer-f32.gguf";
+    if (variant.empty()) return file_exists(edm) ? edm : song;
+    const std::string & want = variant == "edmformer" ? edm : song;
+    const std::string & alt  = variant == "edmformer" ? song : edm;
+    if (file_exists(want) || !file_exists(alt)) return want;
+    fprintf(stderr, "warning: %s not found, using %s with the %s stride "
+            "(weights are the other head's)\n", want.c_str(), alt.c_str(), variant.c_str());
+    return alt;
 }
 
 int main(int argc, char ** argv) {
@@ -43,6 +68,10 @@ int main(int argc, char ** argv) {
         else { usage(argv[0]); return 1; }
     }
     if (audio_path.empty()) { usage(argv[0]); return 1; }
+    if (!variant.empty() && variant != "songformer" && variant != "edmformer") {
+        fprintf(stderr, "unknown variant: %s (use songformer or edmformer)\n", variant.c_str());
+        return 1;
+    }
 
     compute_init(n_threads, !cpu_only);
     fprintf(stderr, "compute: %s\n",
@@ -58,13 +87,12 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "loading models from %s ...\n", model_dir.c_str());
     if (!musicfm.load(model_dir + "/musicfm-f16.gguf")) return 1;
     if (!muq.load(model_dir + "/muq-f16.gguf")) return 1;
-    if (!sf.load(model_dir + "/songformer-f32.gguf")) return 1;
-    if (!variant.empty() && !sf.set_variant(variant)) {
-        fprintf(stderr, "unknown variant: %s (use songformer or edmformer)\n", variant.c_str());
-        return 1;
-    }
-    fprintf(stderr, "head variant: %s (stride %d, %.3f fps)\n",
-            sf.variant.c_str(), sf.ds_stride, sf.frame_rates);
+    const std::string head_path = pick_head_path(model_dir, variant);
+    if (!sf.load(head_path)) return 1;
+    if (!variant.empty() && sf.variant != variant) sf.set_variant(variant);  // fallback only
+    fprintf(stderr, "head: %s — variant %s (stride %d, %.3f fps, %d labels)\n",
+            head_path.c_str(), sf.variant.c_str(), sf.ds_stride, sf.frame_rates,
+            (int) sf.allowed_labels.size());
 
     song_logits lg = process_song(audio, musicfm, muq, sf, n_threads, verbose);
     msa_info msa = logits_to_msa(lg, sf);

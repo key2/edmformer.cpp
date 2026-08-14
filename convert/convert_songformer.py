@@ -15,6 +15,11 @@ and the label set / dataset id used for masking:
 Usage (from the EDMFormer repo root, using its PDM venv):
     pdm run python ../edmformer.cpp/convert/convert_songformer.py \
         --variant edmformer --out ../edmformer.cpp/models/songformer-f32.gguf
+
+--ckpt accepts either the released safetensors (ema_model.* keys) or a raw
+training checkpoint from the EDMFormer trainer (model.ckpt-<step>.pt /
+model.pt: a torch.save dict whose "model_ema" entry holds the EMA state).
+For EDM fine-tuned checkpoints pass --dataset EDMFormer.
 """
 
 import argparse
@@ -56,7 +61,15 @@ def main():
     stride, frame_rates = VARIANTS[args.variant]
     ds = DATASETS[args.dataset]
 
-    sd = load_file(args.ckpt)
+    if args.ckpt.endswith(".pt"):
+        # raw trainer checkpoint: {"model", "optimizer", ..., "model_ema"} where
+        # model_ema = EMA(include_online_model=False).state_dict() -> ema_model.*
+        import torch
+        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        sd = ck["model_ema"] if isinstance(ck, dict) and "model_ema" in ck else ck
+        sd = {k: v for k, v in sd.items() if hasattr(v, "detach")}
+    else:
+        sd = load_file(args.ckpt)
     sd = {k[len("ema_model."):]: v for k, v in sd.items() if k.startswith("ema_model.")}
 
     w = gguf.GGUFWriter(args.out, arch="edmformer-songformer")

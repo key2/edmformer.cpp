@@ -18,7 +18,8 @@ $ ./build/edmformer-cli song.mp3
 ```
 
 No Python at inference time: one binary (or one static library) plus three
-GGUF weight files. Runs on GPU (Metal on macOS) with BLAS/CPU fallback.
+GGUF weight files. Runs on GPU (Metal on macOS, Vulkan or CUDA on Linux) with
+BLAS/CPU fallback.
 A ~3 minute song is analyzed in **~18 s** on Apple Silicon GPU (~75 s CPU+BLAS).
 
 ## How it works
@@ -39,16 +40,19 @@ audio (24 kHz mono)
         [(0.00, "intro"), (56.24, "chorus"), ..., (187.12, "end")]
 ```
 
-Two head variants share identical weights and differ only in the
-TimeDownsample stride (and thus logit frame rate):
+Two heads are supported, each with its own weights file, TimeDownsample
+stride (and thus logit frame rate) and label set:
 
-| Variant | Stride | Frame rate | Select with |
-|---|---|---|---|
-| `songformer` (upstream repo behavior) | 3 | 8.333 fps | `-V songformer` / `set_variant("songformer")` |
-| `edmformer` | 2 | 12.5 fps | `-V edmformer` / `set_variant("edmformer")` |
+| Variant | Weights file | Checkpoint | Stride | Frame rate | Labels |
+|---|---|---|---|---|---|
+| `songformer` | `songformer-f32.gguf` | upstream ASLP-lab SongFormer | 3 | 8.333 fps | intro/verse/chorus/bridge/inst/outro/silence/pre-chorus |
+| `edmformer` | `edmformer-f32.gguf` | EDM-98 fine-tune (EMA, step 2400) | 2 | 12.5 fps | intro/buildup/drop/breakdown/outro/silence |
 
-The default comes from the GGUF metadata (`sf.variant`, chosen at conversion
-time) and can be overridden at runtime since the weights are the same.
+`-V` picks the weights file; stride, frame rate, dataset-embedding id and
+label set then come from that file's GGUF metadata. Without `-V`,
+`edmformer-f32.gguf` is preferred when present. If the requested file is
+missing, the CLI falls back to the other one with a runtime stride override
+(the pre-fine-tune behavior) and a warning.
 
 ## Building
 
@@ -59,6 +63,72 @@ directory `../ggml` by default, configurable with `-DEDMFORMER_GGML_DIR=`):
 cmake -B build -DCMAKE_BUILD_TYPE=Release   # add -DGGML_METAL=ON on macOS
 cmake --build build -j8
 ```
+
+On Linux, pick a GPU backend for ggml at configure time:
+
+```bash
+# Vulkan (any GPU with a Vulkan 1.3 driver; needs libvulkan-dev, glslc, spirv-headers)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+# or CUDA (needs the CUDA toolkit)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build -j$(nproc)
+```
+
+The code is backend-agnostic (it asks ggml for any GPU device), so no source
+changes are needed to switch backends. mp3/wav/npy decode is built in
+(dr_libs); other containers (m4a/aac/mp4/...) use CoreAudio on macOS and fall
+back to piping through the `ffmpeg` CLI on Linux/Windows (runtime dependency
+only).
+
+### Cross-compiling for Windows (from Linux)
+
+Uses MinGW-w64 (`gcc-mingw-w64-x86-64`, POSIX threads flavor) with the Vulkan
+backend; the result is a self-contained `edmformer-cli.exe` that only needs
+the system `vulkan-1.dll` (any GPU driver provides it). One-time deps:
+
+```bash
+# Vulkan headers (any recent tag) — used as-is, no install step
+git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git win-deps/Vulkan-Headers
+# vulkan-1 import library: extract exports from any vulkan-1.dll (wine's works)
+gendef /opt/wine-stable/lib/wine/x86_64-windows/vulkan-1.dll   # -> vulkan-1.def
+sed -i 's/ = winevulkan\..*$//' vulkan-1.def                    # plain export names
+x86_64-w64-mingw32-dlltool -d vulkan-1.def -l win-deps/libvulkan-1.a -D vulkan-1.dll
+# SPIRV-Headers: header-only host package (apt install spirv-headers); ggml's
+# native build finds it in /usr/include implicitly, the cross build must not
+# see /usr/include, so expose just the spirv/ subtree:
+mkdir -p win-deps/spirv-include && ln -s /usr/include/spirv win-deps/spirv-include/spirv
+```
+
+Then configure with the bundled toolchain file (`cmake/toolchain-mingw64.cmake`):
+
+```bash
+cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake \
+    -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON \
+    -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON \
+    -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+    -DGGML_OPENMP=OFF -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_CXX_FLAGS="-isystem $PWD/../win-deps/spirv-include" \
+    -DVulkan_INCLUDE_DIR=$PWD/../win-deps/Vulkan-Headers/include \
+    -DVulkan_LIBRARY=$PWD/../win-deps/libvulkan-1.a \
+    -DVulkan_GLSLC_EXECUTABLE=/usr/bin/glslc \
+    -DSPIRV-Headers_DIR=/usr/share/cmake/SPIRV-Headers
+cmake --build build-win -j$(nproc)
+```
+
+`ggml` builds its Vulkan shader generator with the host compiler
+automatically. The exe runs under WINE with full GPU acceleration
+(`wine build-win/edmformer-cli.exe -m models song.mp3`) — verified
+bit-identical to the native Linux/Vulkan output. Note: wine's winevulkan
+(≤ 11.1) matches `vkGetDeviceQueue2` queues by `memcmp` over the whole
+`VkDeviceQueueInfo2` including uninitialized padding, which makes stock ggml
+submit on a NULL queue and crash. Apply the included fix to the ggml checkout:
+
+```bash
+git -C ../ggml apply ../edmformer.cpp/patches/ggml-vulkan-winevulkan-queue-lookup.patch
+```
+
+(plain `getQueue` when no queue flags are used, zero-initialized struct
+otherwise — behavior on native drivers is unchanged).
 
 Build products:
 
@@ -72,7 +142,8 @@ Build products:
 ./build/edmformer-cli [options] song.{mp3,wav,m4a,npy}
 
   -m DIR    model directory (default: models)
-  -V NAME   head variant: songformer | edmformer (default: GGUF metadata)
+  -V NAME   head model: edmformer (EDM fine-tune) | songformer (upstream)
+            (default: edmformer-f32.gguf when present)
   -t N      threads for the CPU backend
   -o PREFIX write PREFIX.txt (MSA format) and PREFIX.json
   -c        CPU only (disable GPU backend)
@@ -111,12 +182,13 @@ int main() {
     songformer_model head;
     if (!musicfm.load("models/musicfm-f16.gguf")) return 1;
     if (!muq.load("models/muq-f16.gguf"))         return 1;
-    if (!head.load("models/songformer-f32.gguf")) return 1;
-    head.set_variant("songformer");   // optional: override GGUF default
+    if (!head.load("models/edmformer-f32.gguf"))  return 1;  // EDM fine-tune
+    // (or "models/songformer-f32.gguf" for the upstream 8-class head;
+    //  set_variant() only overrides the stride, not labels/weights)
 
     // 3. audio: any decoder works, the pipeline just needs 24 kHz mono f32.
-    //    load_audio handles mp3/wav (dr_libs), m4a/aac (CoreAudio on macOS),
-    //    downmixing and sinc resampling.
+    //    load_audio handles mp3/wav (dr_libs), m4a/aac (CoreAudio on macOS,
+    //    ffmpeg CLI on Linux), downmixing and sinc resampling.
     std::vector<float> samples = load_audio("song.mp3", 24000);
 
     // 4. run the full pipeline (420 s windows, 30 s wrapped chunks, fusion,
@@ -184,10 +256,13 @@ hardcoded label table.
 | `musicfm-f16.gguf` (590 MB) | [`minzwon/MusicFM`](https://huggingface.co/minzwon/MusicFM) — `pretrained_msd.pt` + `msd_stats.json` | ByteDance / Minz Won (MIT) | MusicFM-25Hz self-supervised music model, trained on the Million Song Dataset. 12-layer Wav2Vec2-Conformer (hidden 1024, rotary attention) with a mel + Conv2dSubsampling frontend |
 | `muq-f16.gguf` (590 MB) | [`OpenMuQ/MuQ-large-msd-iter`](https://huggingface.co/OpenMuQ/MuQ-large-msd-iter) — `model.safetensors` | Tencent AI Lab / OpenMuQ (weights: CC-BY-NC-4.0) | MuQ-large SSL model — deliberately reuses the MusicFM skeleton (same 12-layer conformer architecture), trained with Mel-RVQ targets |
 | `songformer-f32.gguf` (104 MB) | [`ASLP-lab/SongFormer`](https://huggingface.co/ASLP-lab/SongFormer) — `SongFormer.safetensors` | ASLP@NPU (CC-BY-4.0), paper [arXiv:2510.02797](https://arxiv.org/abs/2510.02797) | The MSA head: input fusion, TimeDownsample, 4-layer x-transformers encoder, boundary + function heads (EMA weights) |
+| `edmformer-f32.gguf` (104 MB) | [`25ohms/EDM-98`](https://github.com/25ohms/EDM-98) — `data/checkpoints/model.pt` (git LFS) | 25ohms | Same architecture, fine-tuned on the EDM-98 dataset via [`25ohms/EDMFormer`](https://github.com/25ohms/EDMFormer) (raw trainer checkpoint, EMA state at step 2400, dataset id 9, labels intro/buildup/drop/breakdown/outro/silence) |
 
 The Python reference (`EDMFormer/` and `SongFormer/` repos) downloads exactly
 these files via `src/SongFormer/utils/fetch_pretrained.py` and
-`MuQ.from_pretrained()`; the converters read them from those locations.
+`MuQ.from_pretrained()`; the converters read them from those locations. The
+fine-tuned EDM checkpoint comes from the EDM-98 repo's LFS storage
+(`https://media.githubusercontent.com/media/25ohms/EDM-98/main/data/checkpoints/model.pt`).
 
 ### How the GGUF files are generated
 
@@ -199,7 +274,13 @@ present — running the Python pipeline once takes care of downloads):
 cd EDMFormer
 pdm run python ../edmformer.cpp/convert/convert_ssl.py --model musicfm --out ../edmformer.cpp/models/musicfm-f16.gguf
 pdm run python ../edmformer.cpp/convert/convert_ssl.py --model muq     --out ../edmformer.cpp/models/muq-f16.gguf
-pdm run python ../edmformer.cpp/convert/convert_songformer.py --variant edmformer --out ../edmformer.cpp/models/songformer-f32.gguf
+# upstream head (8-class general music labels)
+pdm run python ../edmformer.cpp/convert/convert_songformer.py --variant songformer --out ../edmformer.cpp/models/songformer-f32.gguf
+# EDM fine-tuned head (EDM-98 trainer checkpoint; .pt with model_ema/ema_model.* is unwrapped)
+pdm run python ../edmformer.cpp/convert/convert_songformer.py \
+    --ckpt src/SongFormer/ckpts/edm98-model.pt \
+    --variant edmformer --dataset EDMFormer \
+    --out ../edmformer.cpp/models/edmformer-f32.gguf
 ```
 
 The conversion is not a plain dump — several inference-time transforms are
@@ -283,7 +364,7 @@ src/
   songformer.{h,cpp}        MSA head graph (both stride variants)
   postprocess.{h,cpp}       peak picking, labeling, rule cleanup (plain C++)
   pipeline.{h,cpp}          windowing / fusion / logit accumulation
-  audio.{h,cpp}             dr_mp3, dr_wav, CoreAudio decode + sinc resampler
+  audio.{h,cpp}             dr_mp3, dr_wav, CoreAudio/ffmpeg decode + sinc resampler
   main.cpp                  CLI
 tests/test_parity.cpp       stage-by-stage comparison against fixtures
 third_party/                dr_mp3.h, dr_wav.h (public domain)

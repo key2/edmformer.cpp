@@ -6,8 +6,8 @@
 
 #include <cstdint>
 
-// shared compute environment: GPU (Metal on macOS) primary with CPU fallback,
-// scheduled per-graph with ggml_backend_sched.
+// shared compute environment: GPU (Metal on macOS, Vulkan/CUDA on Linux)
+// primary with CPU fallback, scheduled per-graph with ggml_backend_sched.
 
 // initialize explicitly (idempotent). use_gpu=false forces CPU-only.
 bool compute_init(int n_threads, bool use_gpu);

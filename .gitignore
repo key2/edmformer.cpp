@@ -1,4 +1,5 @@
 build/
+build-win/
 models/*.gguf
 fixtures/
 fixtures-upstream/
