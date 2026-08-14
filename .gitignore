@@ -1,0 +1,9 @@
+build/
+models/*.gguf
+fixtures/
+fixtures-upstream/
+out_*.txt
+out_*.json
+*.log
+.DS_Store
+__pycache__/
