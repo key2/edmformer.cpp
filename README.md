@@ -17,10 +17,12 @@ $ ./build/edmformer-cli song.mp3
 187.12 end
 ```
 
-No Python at inference time: one binary (or one static library) plus three
-GGUF weight files. Runs on GPU (Metal on macOS, Vulkan or CUDA on Linux) with
-BLAS/CPU fallback.
-A ~3 minute song is analyzed in **~18 s** on Apple Silicon GPU (~75 s CPU+BLAS).
+No Python at inference time: one binary (or one static library) plus the
+GGUF weights (two SSL models + one head per variant). Runs on GPU — Metal on
+macOS, Vulkan or CUDA on Linux and Windows (cross-compiled, WINE-verified) —
+with BLAS/CPU fallback. A ~3 minute song is analyzed in **~18 s** on Apple
+Silicon GPU (~75 s CPU+BLAS) and **~17 s** end-to-end on an RTX 5090 with
+Vulkan, model load included.
 
 ## How it works
 
